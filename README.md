@@ -179,6 +179,18 @@ accomplished either by running the process as root, or by increasing the system 
 -l`. Two sector size's worth of data (for current and previous layers) must be locked -- along with 56 *
 `FIL_PROOFS_PARENT_CACHE_SIZE` bytes for the parent cache.
 
+Default parameters have been tuned to provide good performance on the AMD Ryzen Threadripper 3970x. It may be useful to
+experiment with these, especially on different hardware. We have made an effort to use sensible heuristics and to ensure
+reasonable behavior for a range of configurations and hardware, but actual performance or behavior of mulitcore
+replication is not yet well tested except on our target. The following settings may be useful, but do expect some
+failure in the search for good parameters. This might take the form of failed replication (bad proofs), errors during
+replication, or even potentially crashes if parameters prove pathological. For now, this is an experimental feature, and
+only the default configuration on default hardware (3970x) is known to work well.
+
+`FIL_PROOFS_MULTICORE_SDR_PRODUCERS`: This is the number of worker threads loading node parents in parallel. The default is `3` so the producers and main thread together use a full core complex (but no more).
+`FIL_PROOFS_MULTICORE_SDR_PRODUCER_STRIDE`: This is the (max) number of nodes for which a producer thread will load parents in each iteration of its loop. The default is`128`.
+`FIL_PROOFS_MULTICORE_SDR_LOOKAHEAD`: This is the size of the lookahead buffer into which node parents are pre-loaded by the producer threads. The default is 800.
+
 ### GPU Usage
 
 We can now optionally build the column hashed tree 'tree_c' using the GPU with noticeable speed-up over the CPU.  To activate the GPU for this, use the environment variable
