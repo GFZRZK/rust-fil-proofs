@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
+use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::PathBuf;
 use std::sync::Once;
 
 use anyhow::Result;
@@ -76,6 +78,107 @@ fn seal_lifecycle<Tree: 'static + MerkleTreeTrait>(sector_size: u64) -> Result<(
 
     create_seal::<_, Tree>(rng, sector_size, prover_id, false)?;
     Ok(())
+}
+
+fn get_layer_file_paths(cache_dir: &tempfile::TempDir) -> Vec<PathBuf> {
+    fs::read_dir(&cache_dir)
+        .expect("failed to read read directory ")
+        .filter_map(|entry| {
+            let cur = entry.expect("reading directory failed");
+            let entry_path = cur.path();
+            let entry_str = entry_path.to_str().expect("failed to get string from path");
+            if entry_str.contains("data-layer") {
+                Some(entry_path.clone())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn clear_cache_dir_keep_data_layer(cache_dir: &tempfile::TempDir) {
+    for entry in fs::read_dir(&cache_dir).expect("faailed to read directory") {
+        let entry_path = entry.expect("failed get directory entry").path();
+        if entry_path.is_file() {
+            // delete everything except the data-layers
+            if !entry_path
+                .to_str()
+                .expect("failed to get string from path")
+                .contains("data-layer")
+            {
+                fs::remove_file(entry_path).expect("failed to remove file")
+            }
+        }
+    }
+}
+
+#[test]
+fn test_resumable_seal_skip_proofs() {
+    run_resumable_seal(true, 0);
+    run_resumable_seal(true, 1);
+}
+
+#[test]
+#[ignore]
+fn test_resumable_seal() {
+    run_resumable_seal(false, 0);
+    run_resumable_seal(false, 1);
+}
+
+/// Create a seal, delete a layer and resume
+///
+/// The current code works on two layers only. The `layer_to_delete` specifies (zero-based) which
+/// layer should be deleted.
+fn run_resumable_seal(skip_proofs: bool, layer_to_delete: usize) {
+    let sector_size = SECTOR_SIZE_2_KIB;
+    let rng = &mut XorShiftRng::from_seed(TEST_SEED);
+    let prover_fr: DefaultTreeDomain = Fr::random(rng).into();
+    let mut prover_id = [0u8; 32];
+    prover_id.copy_from_slice(AsRef::<[u8]>::as_ref(&prover_fr));
+
+    // First create seals as expected without verifying the proofs so that the cache is still
+    // around
+    let cache_dir = tempfile::tempdir().expect("failed to create temp dir");
+    create_seal_in_cache_dir::<_, SectorShape2KiB>(rng, sector_size, prover_id, true, &cache_dir)
+        .expect("sealing failed");
+    let layers = get_layer_file_paths(&cache_dir);
+    assert_eq!(layers.len(), 2, "not all expected layers were created");
+
+    // Delete one layer, keep the other
+    clear_cache_dir_keep_data_layer(&cache_dir);
+    std::fs::remove_file(&layers[layer_to_delete]).expect("failed to remove first layer");
+    let layers_removed = get_layer_file_paths(&cache_dir);
+    assert_eq!(layers_removed.len(), 1, "found more than one layer");
+    if layer_to_delete == 0 {
+        assert_eq!(layers_removed[0], layers[1], "wrong layer was removed");
+    } else {
+        assert_eq!(layers_removed[0], layers[0], "wrong layer was removed");
+    }
+
+    // Resume the seal
+    create_seal_in_cache_dir::<_, SectorShape2KiB>(
+        rng,
+        sector_size,
+        prover_id,
+        skip_proofs,
+        &cache_dir,
+    )
+    .expect("sealing failed");
+
+    // Running proofs clears the cache, hence we can only check for existence of filed if we don't
+    // run them
+    if skip_proofs {
+        let layers_recreated = get_layer_file_paths(&cache_dir);
+        assert_eq!(
+            layers_recreated.len(),
+            2,
+            "not all expected layers were recreated"
+        );
+        assert_eq!(
+            layers_recreated, layers,
+            "recreated layers don't match original ones"
+        );
+    }
 }
 
 #[test]
@@ -416,6 +519,24 @@ fn create_seal<R: Rng, Tree: 'static + MerkleTreeTrait>(
     prover_id: ProverId,
     skip_proof: bool,
 ) -> Result<(SectorId, NamedTempFile, Commitment, tempfile::TempDir)> {
+    let cache_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let (sector_id, replica, comm_r) =
+        create_seal_in_cache_dir::<_, Tree>(rng, sector_size, prover_id, skip_proof, &cache_dir)?;
+
+    if skip_proof {
+        clear_cache::<Tree>(cache_dir.path())?;
+    }
+
+    Ok((sector_id, replica, comm_r, cache_dir))
+}
+
+fn create_seal_in_cache_dir<R: Rng, Tree: 'static + MerkleTreeTrait>(
+    rng: &mut R,
+    sector_size: u64,
+    prover_id: ProverId,
+    skip_proof: bool,
+    cache_dir: &tempfile::TempDir,
+) -> Result<(SectorId, NamedTempFile, Commitment)> {
     init_logger();
 
     let number_of_bytes_in_piece = UnpaddedBytesAmount::from(PaddedBytesAmount(sector_size));
@@ -456,8 +577,6 @@ fn create_seal<R: Rng, Tree: 'static + MerkleTreeTrait>(
         porep_id: arbitrary_porep_id,
     };
 
-    let cache_dir = tempfile::tempdir().expect("failed to create temp dir");
-
     let ticket = rng.gen();
     let seed = rng.gen();
     let sector_id = rng.gen::<u64>().into();
@@ -491,9 +610,7 @@ fn create_seal<R: Rng, Tree: 'static + MerkleTreeTrait>(
 
     validate_cache_for_commit::<_, _, Tree>(cache_dir.path(), sealed_sector_file.path())?;
 
-    if skip_proof {
-        clear_cache::<Tree>(cache_dir.path())?;
-    } else {
+    if !skip_proof {
         let phase1_output = seal_commit_phase1::<_, Tree>(
             config,
             cache_dir.path(),
@@ -553,7 +670,7 @@ fn create_seal<R: Rng, Tree: 'static + MerkleTreeTrait>(
         assert!(verified, "failed to verify valid seal");
     }
 
-    Ok((sector_id, sealed_sector_file, comm_r, cache_dir))
+    Ok((sector_id, sealed_sector_file, comm_r))
 }
 
 fn create_fake_seal<R: rand::Rng, Tree: 'static + MerkleTreeTrait>(
